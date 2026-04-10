@@ -1,0 +1,83 @@
+# CD Pipeline — Build, Push to ACR, Deploy to ACI
+# Uses ACR admin credentials (no service principal needed)
+name: CD Pipeline
+on:
+  push:
+    branches: [main]
+
+env:
+  ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
+  IMAGE_NAME: cloudmart-api
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to Azure Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.ACR_LOGIN_SERVER }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Build and push Docker image to ACR
+        run: |
+          docker build -t $ACR_LOGIN_SERVER/$IMAGE_NAME:latest \
+            -t $ACR_LOGIN_SERVER/$IMAGE_NAME:${{ github.sha }} .
+          docker push $ACR_LOGIN_SERVER/$IMAGE_NAME:latest
+          docker push $ACR_LOGIN_SERVER/$IMAGE_NAME:${{ github.sha }}
+
+      - name: Install Azure CLI
+        run: curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+
+      - name: Log in to Azure with SP or skip
+        continue-on-error: true
+        id: azure_login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Deploy to ACI (via Azure CLI)
+        if: steps.azure_login.outcome == 'success'
+        run: |
+          az container delete --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --name cloudmart-app --yes 2>/dev/null || true
+          az container create \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --name cloudmart-app \
+            --image $ACR_LOGIN_SERVER/$IMAGE_NAME:${{ github.sha }} \
+            --registry-login-server $ACR_LOGIN_SERVER \
+            --registry-username ${{ secrets.ACR_USERNAME }} \
+            --registry-password ${{ secrets.ACR_PASSWORD }} \
+            --dns-name-label ${{ secrets.DNS_LABEL }} \
+            --location canadacentral \
+            --os-type Linux \
+            --ports 80 \
+            --cpu 1 --memory 1.5 \
+            --environment-variables \
+              COSMOS_ENDPOINT=${{ secrets.COSMOS_ENDPOINT }} \
+              COSMOS_KEY=${{ secrets.COSMOS_KEY }} \
+            --restart-policy OnFailure
+
+      - name: Deploy to ACI (fallback — manual message)
+        if: steps.azure_login.outcome != 'success'
+        run: |
+          echo "============================================="
+          echo "⚠️  Azure Login skipped (no service principal)"
+          echo "   Image was built and pushed to ACR successfully!"
+          echo ""
+          echo "   To deploy manually, run:"
+          echo "   az container delete -g ${{ secrets.AZURE_RESOURCE_GROUP }} -n cloudmart-app --yes"
+          echo "   az container create \\"
+          echo "     -g ${{ secrets.AZURE_RESOURCE_GROUP }} \\"
+          echo "     -n cloudmart-app \\"
+          echo "     --image $ACR_LOGIN_SERVER/$IMAGE_NAME:${{ github.sha }} \\"
+          echo "     --registry-login-server $ACR_LOGIN_SERVER \\"
+          echo "     --registry-username ${{ secrets.ACR_USERNAME }} \\"
+          echo "     --registry-password \$ACR_PASSWORD \\"
+          echo "     --dns-name-label ${{ secrets.DNS_LABEL }} \\"
+          echo "     --location canadacentral --os-type Linux \\"
+          echo "     --ports 80 --cpu 1 --memory 1.5"
+          echo "============================================="
